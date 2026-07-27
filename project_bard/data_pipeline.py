@@ -7,9 +7,7 @@ import urllib.request
 from pathlib import Path
 from typing import List, Iterator
 
-from datasketch import MinHash, MinHashL
-
-SH
+from datasketch import MinHash, MinHashLSH
 from config import (
     DATA_SOURCES, RAW_DIR, CLEAN_TEXT_PATH, RAW_TEXT_PATH
 )
