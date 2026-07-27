@@ -1,0 +1,8 @@
+torch>=2.1
+numpy
+tokenizers>=0.15
+datasketch
+requests
+transformers>=4.40
+trl>=0.8
+datasets>=2.18
