@@ -117,4 +117,4 @@ DPO_BETA = 0.1
 # -----------------------------
 USE_WANDB = True
 WANDB_PROJECT = "project-bard"
-WANDB_ENTITY = stanlleylocke       # Set to your username
+WANDB_ENTITY = "lockestanley-blueribbonsinvest"
