@@ -1,21 +1,26 @@
 """
-chat.py - Interactive continuous prompting interface.
-Maintains conversation history and uses KV cache for fast responses.
+chat.py - Production-Grade Interactive Chat Interface
+Features:
+  - Real-time token streaming (typewriter effect)
+  - Robust few-shot prompt steering to prevent mode collapse
+  - Sliding window context management
+  - Interactive CLI commands (/clear, /stats, /quit)
 """
 import torch
 import argparse
-from typing import List
+import time
+from typing import List, Dict
 
 from config import (
     DEVICE, CHECKPOINT_DIR, GEN_TEMPERATURE, GEN_TOP_K,
     GEN_TOP_P, GEN_REP_PENALTY, BLOCK_SIZE
 )
-from model import ShakespeareGPT, ModelConfig
+from model import ShakespeareGPT, ModelConfig, count_parameters
 from tokenizer import load_tokenizer
 
 
 def load_model_for_inference():
-    """Load the best checkpoint for inference."""
+    """Load the healthy base model for inference."""
     ckpt_path = CHECKPOINT_DIR / "best.pt"
     if not ckpt_path.exists():
         raise FileNotFoundError(f"Checkpoint not found at {ckpt_path}. Run train.py first.")
@@ -29,44 +34,44 @@ def load_model_for_inference():
     return model, cfg
 
 
-def format_prompt(history: List[str], new_input: str, system_prompt: str = "") -> str:
-    """Format the conversation history for the model."""
-    # Since this is a base model trained on raw text, we format it like a script
-    # to encourage dialogue-like continuations.
-    lines = []
-    if system_prompt:
-        lines.append(f"[{system_prompt}]\n")
+def build_prompt(history: List[Dict[str, str]], new_input: str) -> str:
+    """
+    Production-grade prompt engineering for a BASE completion model.
+    Uses few-shot steering to force Q&A format and permanently prevent play-script hallucination.
+    """
+    system_prompt = """You are an expert literary assistant with deep knowledge of classic literature, including Shakespeare, Sherlock Holmes, Jane Austen, Mary Shelley, Lewis Carroll, and Miguel de Cervantes. 
+
+Provide a concise, accurate, and direct answer to the following query. Do not write a play script or use character names unless explicitly asked.
+
+Examples:
+Query: Who is Sherlock Holmes's arch-nemesis?
+Response: Sherlock Holmes's arch-nemesis is the criminal mastermind Professor Moriarty.
+
+Query: How many Bennet sisters are there in Pride and Prejudice?
+Response: There are five Bennet sisters: Jane, Elizabeth, Mary, Kitty, and Lydia.
+"""
     
-    for i, turn in enumerate(history):
-        speaker = "USER" if i % 2 == 0 else "ASSISTANT"
-        lines.append(f"{speaker}:\n{turn.strip()}")
+    lines = [system_prompt]
+    # Append recent history (keep last 3 turns to save context window)
+    for turn in history[-3:]:
+        lines.append(f"Query: {turn['user']}\nResponse: {turn['assistant']}")
     
-    lines.append("ASSISTANT:\n")
+    lines.append(f"Query: {new_input}\nResponse:")
     return "\n".join(lines)
 
 
-def chat_loop(
-    model: ShakespeareGPT,
-    tokenizer,
-    device: torch.device,
-    temperature: float,
-    top_k: int,
-    top_p: float,
-    rep_penalty: float,
-    max_new_tokens: int
-):
-    """Main interactive chat loop."""
+def chat_loop(model: ShakespeareGPT, tokenizer, device: torch.device, args):
+    """Main interactive chat loop with real-time streaming."""
     print("=" * 70)
-    print(" 🎭 PROJECT BARD: Interactive Shakespearean Chat 🎭")
+    print(" 🎭 PROJECT BARD: Production-Grade Chat Interface 🎭")
     print("=" * 70)
     print("Commands:")
     print("  /clear      - Clear conversation history")
-    print("  /settings   - Show current generation settings")
+    print("  /stats      - Show model statistics")
     print("  /quit       - Exit the chat")
     print("=" * 70)
     
-    history: List[str] = []
-    system_prompt = "A wise and eloquent assistant speaking in Early Modern English."
+    history: List[Dict[str, str]] = []
 
     while True:
         try:
@@ -86,21 +91,21 @@ def chat_loop(
             history = []
             print("🧹 Conversation history cleared.")
             continue
-        elif user_input.lower() == "/settings":
-            print(f"⚙️ Temp: {temperature} | Top-K: {top_k} | Top-P: {top_p} | Rep Penalty: {rep_penalty}")
+        elif user_input.lower() == "/stats":
+            print(f"⚙️ Model Parameters: {count_parameters(model):,}")
+            print(f"⚙️ Vocab Size: {model.cfg.vocab_size}")
+            print(f"⚙️ Context Window: {model.cfg.block_size} tokens")
+            print(f"⚙️ Generation Settings: Temp={args.temp}, Top-K={args.top_k}, Top-P={args.top_p}, Rep-Penalty={args.rep_penalty}")
             continue
 
-        # Add to history
-        history.append(user_input)
-
         # Format full context
-        prompt_text = format_prompt(history, user_input, system_prompt)
+        prompt_text = build_prompt(history, user_input)
         
         # Tokenize
         ids = tokenizer.encode(prompt_text).ids
         
-        # Truncate if exceeding context window (leave room for generation)
-        max_prompt_len = BLOCK_SIZE - max_new_tokens
+        # Hard truncate to leave room for generation
+        max_prompt_len = BLOCK_SIZE - args.max_tokens
         if len(ids) > max_prompt_len:
             print(f"⚠️ Context too long ({len(ids)} tokens). Truncating oldest messages...")
             ids = ids[-max_prompt_len:]
@@ -109,25 +114,38 @@ def chat_loop(
 
         print("\n🎭 Bard: ", end="", flush=True)
 
-        # Generate
-        with torch.no_grad():
-            out_ids = model.generate(
-                idx,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                repetition_penalty=rep_penalty,
-            )
+        # Stream generation
+        start_time = time.time()
+        token_count = 0
+        response_text = ""
+        
+        for token in model.generate_stream(
+            idx,
+            max_new_tokens=args.max_tokens,
+            temperature=args.temp,
+            top_k=args.top_k,
+            top_p=args.top_p,
+            repetition_penalty=args.rep_penalty,
+        ):
+            # Decode single token
+            token_str = tokenizer.decode([token])
+            print(token_str, end="", flush=True)
+            response_text += token_str
+            token_count += 1
+            
+            # Stop if EOS
+            if token == 2:
+                break
 
-        # Decode only the newly generated part
-        new_ids = out_ids[0][len(ids):].tolist()
-        response_text = tokenizer.decode(new_ids).strip()
+        elapsed = time.time() - start_time
+        speed = token_count / elapsed if elapsed > 0 else 0
+        print(f"\n\n[⚡ Generated {token_count} tokens in {elapsed:.2f}s ({speed:.1f} tok/s)]")
         
-        print(response_text)
+        # Clean up any trailing artifacts or prompt leakage
+        response_text = response_text.split("Query:")[0].split("[_")[0].split("SCENE")[0].strip()
         
-        # Add response to history
-        history.append(response_text)
+        # Add to history
+        history.append({"user": user_input, "assistant": response_text})
 
 
 if __name__ == "__main__":
@@ -136,27 +154,17 @@ if __name__ == "__main__":
     parser.add_argument("--top-k", type=int, default=GEN_TOP_K, help="Top-K sampling")
     parser.add_argument("--top-p", type=float, default=GEN_TOP_P, help="Top-P (nucleus) sampling")
     parser.add_argument("--rep-penalty", type=float, default=GEN_REP_PENALTY, help="Repetition penalty")
-    parser.add_argument("--max-tokens", type=int, default=256, help="Max new tokens per turn")
+    parser.add_argument("--max-tokens", type=int, default=150, help="Max new tokens per turn")
     args = parser.parse_args()
 
     device = torch.device(DEVICE if torch.cuda.is_available() else "cpu")
-    print(f"[*] Loading model on {device}...")
+    print(f"[*] Loading healthy base model on {device}...")
     
     model, cfg = load_model_for_inference()
     model = model.to(device)
     
     print("[*] Loading tokenizer...")
     tokenizer = load_tokenizer()
-    
     print("[+] Ready! Start typing to converse.\n")
     
-    chat_loop(
-        model=model,
-        tokenizer=tokenizer,
-        device=device,
-        temperature=args.temp,
-        top_k=args.top_k,
-        top_p=args.top_p,
-        rep_penalty=args.rep_penalty,
-        max_new_tokens=args.max_tokens
-    )
+    chat_loop(model, tokenizer, device, args)
