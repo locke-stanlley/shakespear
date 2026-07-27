@@ -78,7 +78,7 @@ BATCH_SIZE = 8             # Smaller per-step
 GRAD_ACCUM_STEPS = 8       # Effective batch = 64
 BATCH_SIZE_EFFECTIVE = BATCH_SIZE * GRAD_ACCUM_STEPS
 NUM_EPOCHS = 3
-LEARNING_RATE = 3e-4
+LEARNING_RATE = 1.5e-4     # FIXED: More conservative for 91M params
 WEIGHT_DECAY = 0.1
 BETA1 = 0.9
 BETA2 = 0.95
@@ -117,4 +117,4 @@ DPO_BETA = 0.1
 # -----------------------------
 USE_WANDB = True
 WANDB_PROJECT = "project-bard"
-WANDB_ENTITY = "lockestanley-blueribbonsinvest"
+WANDB_ENTITY = "lockestanley-blueribbonsinvest"  # YOUR ENTITY NAME

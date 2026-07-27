@@ -230,14 +230,10 @@ class ShakespeareGPT(nn.Module):
             self.register_buffer("rope_sin", sin, persistent=False)
 
         self.apply(self._init_weights)
-        # Depth-scaled init for residual projections
+        # FIXED: Depth-scaled init for residual projections (standard Llama/GPT practice)
         for pn, p in self.named_parameters():
             if pn.endswith("out_proj.weight") or pn.endswith("w2.weight"):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * cfg.n_layer))
-
-        # Enable gradient checkpointing
-        if cfg.use_grad_checkpoint:
-            self._enable_gradient_checkpointing()
+                torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(cfg.n_layer))
 
     def _enable_gradient_checkpointing(self):
         """Trade compute for memory - allows 2-3x larger models"""
