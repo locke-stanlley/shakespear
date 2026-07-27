@@ -143,8 +143,15 @@ def run_sft():
     tokenizer = load_tokenizer()
     device = torch.device(DEVICE if torch.cuda.is_available() else "cpu")
 
-    model = load_model().to(device)
+    # Load the base model WITH its config
+    base_ckpt_path = CHECKPOINT_DIR / "best.pt"
+    base_ckpt = torch.load(base_ckpt_path, map_location="cpu", weights_only=False)
+    cfg: ModelConfig = base_ckpt["config"]
+    
+    model = ShakespeareGPT(cfg).to(device)
+    model.load_state_dict(base_ckpt["model_state_dict"])
     model.train()
+    
     optimizer = torch.optim.AdamW(model.parameters(), lr=SFT_LR, weight_decay=0.01)
 
     ds = SFTDataset(SFT_DATA_PATH, tokenizer)
@@ -164,7 +171,11 @@ def run_sft():
             n += 1
         print(f"    [SFT epoch {epoch+1}/{SFT_EPOCHS}] loss={total/max(1,n):.4f}")
 
-    torch.save(model.state_dict(), CHECKPOINT_DIR / "sft_model.pt")
+    # FIXED: Save the full checkpoint with config, not just state_dict
+    torch.save({
+        "model_state_dict": model.state_dict(),
+        "config": cfg,
+    }, CHECKPOINT_DIR / "sft_model.pt")
     print("[+] SFT model saved successfully.\n")
 
 
@@ -284,14 +295,14 @@ def test_generation_post_alignment():
     
     device = torch.device(DEVICE if torch.cuda.is_available() else "cpu")
     
-    # Load the SFT model
+    # FIXED: Load the SFT model WITH its config
     ckpt_path = CHECKPOINT_DIR / "sft_model.pt"
     if not ckpt_path.exists():
         print("[!] SFT model not found. Skipping generation test.")
         return
         
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    cfg: ModelConfig = ckpt["config"]
+    cfg: ModelConfig = ckpt["config"]  # Now this will work!
     model = ShakespeareGPT(cfg)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval().to(device)
