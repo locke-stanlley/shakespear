@@ -63,7 +63,9 @@ def evaluate(model: ShakespeareGPT, device: torch.device, dtype: torch.dtype) ->
         for x, y in dl:
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             with autocast(device_type=device.type, dtype=dtype):
-                _, loss, _ = model(x, y)
+                model_out = model(x, y)
+                # Handle both dict (new) and tuple (legacy) return types
+                loss = model_out["loss"] if isinstance(model_out, dict) else model_out[1]
             losses.append(loss.item())
         mean_loss = sum(losses) / max(1, len(losses))
         out[f"{split}_loss"] = mean_loss
@@ -180,7 +182,9 @@ def train():
             is_last_accum = (accum_step == GRAD_ACCUM_STEPS - 1)
 
             with autocast(device_type=device.type, dtype=dtype):
-                _, loss, _ = model(x, y)
+                model_out = model(x, y)
+                # Handle both dict (new) and tuple (legacy) return types
+                loss = model_out["loss"] if isinstance(model_out, dict) else model_out[1]
                 loss = loss / GRAD_ACCUM_STEPS
 
             scaler.scale(loss).backward()
