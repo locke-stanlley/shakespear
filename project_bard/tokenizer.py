@@ -7,13 +7,12 @@ Features:
   - Enhanced pre-tokenization (digits, punctuation, whitespace)
   - BOS/EOS post-processing
   - Comprehensive vocabulary analysis and statistics
-  - Multi-threaded encoding for speed
   - Vocabulary export for inspection
+  - Tokenization coverage metrics
 """
 import numpy as np
 from pathlib import Path
-from typing import List, Dict
-from collections import Counter
+from typing import Dict
 from tokenizers import Tokenizer, models, pre_tokenizers, trainers, processors, decoders, normalizers
 
 from config import (
@@ -214,18 +213,13 @@ def calculate_coverage(tokenizer: Tokenizer, sample_size: int = 100000) -> Dict:
 
 
 def digitize_and_save(tokenizer: Tokenizer) -> np.memmap:
-    """Convert the cleaned corpus to token IDs with multi-threaded encoding."""
+    """Convert the cleaned corpus to token IDs. (Threading is handled automatically by the Rust backend)."""
     print("\n[*] Digitizing corpus...")
     
     text = CLEAN_TEXT_PATH.read_text(encoding="utf-8")
-    
-    # Note: BOS/EOS are now handled by the post-processor, so we don't add them manually
     print(f"    Corpus size: {len(text):,} characters")
     
-    # Enable parallel encoding for speed
-    tokenizer.enable_threading(True)
-    
-    print("[*] Encoding text to token IDs (multi-threaded)...")
+    print("[*] Encoding text to token IDs...")
     encoding = tokenizer.encode(text)
     ids = np.array(encoding.ids, dtype=np.uint16)  # uint16 supports up to 65535 tokens
     

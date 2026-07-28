@@ -1,14 +1,12 @@
 """
 data_pipeline.py - Production-Grade Multi-Source Data Collection and Curation
 Features:
-  - Expanded data sources (Wikipedia, arXiv, code, diverse literature)
-  - Parallel downloads with retry logic
-  - Advanced quality filtering (language detection, quality scoring)
-  - Enhanced PII scrubbing (names, addresses, financial data)
+  - Expanded data sources (diverse classic literature and reliable raw text)
+  - Parallel downloads with retry logic and incremental resumption
+  - Advanced quality filtering (preserves paragraph structure)
+  - Enhanced PII scrubbing (emails, phones, financial data, IPs, dates)
   - Document-level and paragraph-level deduplication
-  - Metadata tracking and statistics
-  - Incremental processing with resume capability
-  - Comprehensive data quality reporting
+  - Metadata tracking and comprehensive data quality reporting
 """
 import re
 import hashlib
@@ -21,54 +19,60 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
 import time
 
-from datasketch import MinHash, MinHashL
+from datasketch import MinHash, MinHashLSH
 
 from config import (
     DATA_SOURCES, RAW_DIR, CLEAN_TEXT_PATH, RAW_TEXT_PATH, DATA_DIR
 )
 
-# Additional data sources for larger token base
+# Expanded data sources for a larger, richer token base
 EXPANDED_DATA_SOURCES = [
-    # Classic Literature (Gutenberg)
-    "https://www.gutenberg.org/cache/epub/100/pg100.txt",  # Shakespeare
-    "https://www.gutenberg.org/cache/epub/84/pg84.txt",    # Frankenstein
-    "https://www.gutenberg.org/cache/epub/1342/pg1342.txt", # Pride & Prejudice
-    "https://www.gutenberg.org/cache/epub/11/pg11.txt",    # Alice in Wonderland
-    "https://www.gutenberg.org/cache/epub/996/pg996.txt",  # Don Quixote
-    "https://www.gutenberg.org/cache/epub/1661/pg1661.txt", # Sherlock Holmes
-    "https://www.gutenberg.org/cache/epub/1400/pg1400.txt", # Great Expectations
-    "https://www.gutenberg.org/cache/epub/1257/pg1257.txt", # The Iliad
-    "https://www.gutenberg.org/cache/epub/8800/pg8800.txt", # The Divine Comedy
-    "https://www.gutenberg.org/cache/epub/76/pg76.txt",    # Adventures of Huckleberry Finn
-    "https://www.gutenberg.org/cache/epub/215/pg215.txt",  # The Picture of Dorian Gray
-    "https://www.gutenberg.org/cache/epub/98/pg98.txt",    # A Tale of Two Cities
-    "https://www.gutenberg.org/cache/epub/160/pg160.txt",  # The Awakening
-    "https://www.gutenberg.org/cache/epub/1260/pg1260.txt", # Jane Eyre
-    "https://www.gutenberg.org/cache/epub/1727/pg1727.txt", # The Odyssey
-    
-    # Wikipedia (sample articles - you can expand this)
-    "https://en.wikipedia.org/wiki/Special:ExportRandom",  # Random articles
-    
-    # Academic/Technical (sample)
-    "https://raw.githubusercontent.com/github/gitignore/main/Python.gitignore",  # Code patterns
+    # Classic Literature (Project Gutenberg)
+    "https://www.gutenberg.org/cache/epub/100/pg100.txt",   # The Complete Works of William Shakespeare
+    "https://www.gutenberg.org/cache/epub/84/pg84.txt",      # Frankenstein by Mary Shelley
+    "https://www.gutenberg.org/cache/epub/1342/pg1342.txt",  # Pride and Prejudice by Jane Austen
+    "https://www.gutenberg.org/cache/epub/11/pg11.txt",      # Alice's Adventures in Wonderland by Lewis Carroll
+    "https://www.gutenberg.org/cache/epub/996/pg996.txt",    # Don Quixote by Miguel de Cervantes
+    "https://www.gutenberg.org/cache/epub/1661/pg1661.txt",  # The Adventures of Sherlock Holmes by Arthur Conan Doyle
+    "https://www.gutenberg.org/cache/epub/1400/pg1400.txt",  # Great Expectations by Charles Dickens
+    "https://www.gutenberg.org/cache/epub/1257/pg1257.txt",  # The Iliad by Homer
+    "https://www.gutenberg.org/cache/epub/8800/pg8800.txt",  # The Divine Comedy by Dante Alighieri
+    "https://www.gutenberg.org/cache/epub/76/pg76.txt",      # Adventures of Huckleberry Finn by Mark Twain
+    "https://www.gutenberg.org/cache/epub/215/pg215.txt",    # The Picture of Dorian Gray by Oscar Wilde
+    "https://www.gutenberg.org/cache/epub/98/pg98.txt",      # A Tale of Two Cities by Charles Dickens
+    "https://www.gutenberg.org/cache/epub/160/pg160.txt",    # The Awakening by Kate Chopin
+    "https://www.gutenberg.org/cache/epub/1260/pg1260.txt",  # Jane Eyre by Charlotte Bronte
+    "https://www.gutenberg.org/cache/epub/1727/pg1727.txt",  # The Odyssey by Homer
+    # Reliable raw text sources
+    "https://en.wikipedia.org/w/index.php?title=William_Shakespeare&action=raw", # Wikipedia raw text
 ]
 
 # Metadata tracking
 METADATA_PATH = DATA_DIR / "pipeline_metadata.json"
 
+# Regex patterns
+GUTENBERG_HEADER_RE = re.compile(
+    r"\*\*\*START OF (THE|THIS) PROJECT GUTENBERG.*?\*\*\*(.+?)\*\*\*END OF",
+    re.DOTALL | re.IGNORECASE,
+)
+WIKI_HEADER_RE = re.compile(
+    r"<mediawiki.*?>.*?</mediawiki>",
+    re.DOTALL | re.IGNORECASE,
+)
+
 
 def download_single_source(url: str, index: int, max_retries: int = 3) -> Tuple[int, str, bool]:
-    """Download a single source with retry logic."""
+    """Download a single source with retry logic and incremental resumption."""
     filename = RAW_DIR / f"source_{index}.txt"
     
-    if filename.exists():
+    # Incremental processing: skip if already downloaded
+    if filename.exists() and filename.stat().st_size > 0:
         return index, str(filename), True
     
     for attempt in range(max_retries):
         try:
             print(f"[*] Downloading [{index}] {url} (attempt {attempt + 1}/{max_retries})")
             
-            # Add timeout and user agent
             req = urllib.request.Request(
                 url,
                 headers={'User-Agent': 'ProjectBard/1.0 (Educational ML Project)'}
@@ -160,66 +164,66 @@ def download_all_sources_parallel() -> Dict:
 # HEURISTIC FILTERING
 # ============================================================================
 
-GUTENBERG_HEADER_RE = re.compile(
-    r"\*\*\*START OF (THE|THIS) PROJECT GUTENBERG.*?\*\*\*(.+?)\*\*\*END OF",
-    re.DOTALL | re.IGNORECASE,
-)
-
-WIKI_HEADER_RE = re.compile(
-    r"<mediawiki.*?>.*?</mediawiki>",
-    re.DOTALL | re.IGNORECASE,
-)
-
 def heuristic_filter(text: str) -> str:
-    """Advanced heuristic filtering with multiple rules."""
+    """
+    Advanced heuristic filtering with multiple rules.
+    CRITICAL FIX: Preserves paragraph structure (\n\n) instead of collapsing everything.
+    """
     # Remove Gutenberg headers/footers
     text = GUTENBERG_HEADER_RE.sub("", text)
     text = re.sub(r"^\*{3,}.*\*{3,}$", "", text, flags=re.MULTILINE)
     
-    # Remove Wikipedia XML tags
+    # Remove Wikipedia XML tags and HTML
     text = WIKI_HEADER_RE.sub("", text)
-    text = re.sub(r"<[^>]+>", "", text)  # Remove HTML/XML tags
+    text = re.sub(r"<[^>]+>", "", text)
     
-    lines = []
-    for raw in text.splitlines():
-        line = raw.strip()
+    paragraphs = []
+    # CRITICAL FIX: Split by double newline to preserve paragraph structure
+    for raw_para in text.split("\n\n"):
+        lines = []
+        for raw in raw_para.splitlines():
+            line = raw.strip()
+            
+            if not line:
+                continue
+            
+            # Skip very short lines
+            if len(line) < 10:
+                continue
+            
+            # Calculate character quality metrics
+            alpha = sum(c.isalpha() for c in line)
+            space = sum(c.isspace() for c in line)
+            digit = sum(c.isdigit() for c in line)
+            special = len(line) - alpha - space - digit
+            
+            # Skip lines with too many non-alphabetic characters
+            if alpha / len(line) < 0.5:
+                continue
+            
+            # Skip lines that are mostly digits (tables, code)
+            if digit / len(line) > 0.3:
+                continue
+            
+            # Skip lines with too many special characters
+            if special / len(line) > 0.2:
+                continue
+            
+            # Skip lines that look like URLs or file paths
+            if re.match(r'^https?://', line) or re.match(r'^[/\\]', line):
+                continue
+            
+            # Skip lines that look like code comments
+            if line.startswith('//') or line.startswith('#') or line.startswith('/*'):
+                continue
+            
+            lines.append(line)
         
-        if not line:
-            continue
-        
-        # Skip very short lines
-        if len(line) < 10:
-            continue
-        
-        # Calculate character quality metrics
-        alpha = sum(c.isalpha() for c in line)
-        space = sum(c.isspace() for c in line)
-        digit = sum(c.isdigit() for c in line)
-        special = len(line) - alpha - space - digit
-        
-        # Skip lines with too many non-alphabetic characters
-        if alpha / len(line) < 0.5:
-            continue
-        
-        # Skip lines that are mostly digits (tables, code)
-        if digit / len(line) > 0.3:
-            continue
-        
-        # Skip lines with too many special characters
-        if special / len(line) > 0.2:
-            continue
-        
-        # Skip lines that look like URLs or file paths
-        if re.match(r'^https?://', line) or re.match(r'^[/\\]', line):
-            continue
-        
-        # Skip lines that look like code comments
-        if line.startswith('//') or line.startswith('#') or line.startswith('/*'):
-            continue
-        
-        lines.append(line)
+        if lines:
+            # Join valid lines within a paragraph, preserving internal structure
+            paragraphs.append("\n".join(lines))
     
-    return "\n".join(lines)
+    return "\n\n".join(paragraphs)
 
 
 # ============================================================================
@@ -368,7 +372,7 @@ def calculate_statistics(text: str) -> Dict:
     
     # Average metrics
     avg_word_length = sum(len(w) for w in words) / len(words) if words else 0
-    avg_sentence_length = len(words) / len(paragraphs) if paragraphs else 0
+    avg_words_per_paragraph = len(words) / len(paragraphs) if paragraphs else 0
     
     return {
         "total_characters": chars,
@@ -377,7 +381,7 @@ def calculate_statistics(text: str) -> Dict:
         "total_paragraphs": len(paragraphs),
         "unique_words": unique_words,
         "avg_word_length": avg_word_length,
-        "avg_words_per_paragraph": avg_sentence_length,
+        "avg_words_per_paragraph": avg_words_per_paragraph,
         "vocabulary_richness": unique_words / len(words) if words else 0,
     }
 
@@ -423,10 +427,10 @@ def run_data_pipeline() -> Path:
     filtered_stats = calculate_statistics(filtered)
     
     print(f"    After filtering: {filtered_stats['total_characters']:,} chars ({filtered_stats['total_characters']/raw_stats['total_characters']*100:.1f}% retained)")
+    print(f"    Paragraphs retained: {filtered_stats['total_paragraphs']:,}")
     
     # Step 4: Split into paragraphs
     paragraphs = [p.strip() for p in filtered.split("\n\n") if p.strip()]
-    print(f"    Paragraphs: {len(paragraphs):,}")
     
     # Step 5: Quality filtering
     print("\n[*] Applying quality filters...")
@@ -466,7 +470,7 @@ def run_data_pipeline() -> Path:
         "raw": raw_stats,
         "filtered": filtered_stats,
         "final": final_stats,
-        "retention_rate": final_stats['total_characters'] / raw_stats['total_characters'],
+        "retention_rate": final_stats['total_characters'] / raw_stats['total_characters'] if raw_stats['total_characters'] > 0 else 0,
     }
     
     save_metadata(all_stats)
