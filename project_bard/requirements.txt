@@ -7,3 +7,12 @@ echo "What is the name of Hamlet's mother?" >> prompts.txt
 python generate.py --prompts-file prompts.txt --stop-sequence "SCENE" --output-file results.jsonl
 
 python generate.py --prompt "To be, or not to be, that is the question:" --temperature 0.9 --top-p 0.95 --rep-penalty 1.2 --seed 42
+
+# Test multi-genre retention
+python generate.py --prompts-file prompts_all_datasets.txt --max-tokens 150 --temperature 0.8 --output-file results_all.jsonl
+
+# Test generalized prose generation
+python generate.py --prompts-file prompts_generalized.txt --max-tokens 200 --temperature 0.85 --output-file results_general.jsonl
+
+# Test deep style mimicry
+python generate.py --prompts-file prompts_specific.txt --max-tokens 150 --temperature 0.75 --rep-penalty 1.15 --output-file results_specific.jsonl
