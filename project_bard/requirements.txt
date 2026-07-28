@@ -1,0 +1,9 @@
+python generate.py --prompt "It was on a dreary night of November that I beheld" --stream --max-tokens 150
+
+# Create a file named prompts.txt with your test cases
+echo "Who is Sherlock Holmes's arch-nemesis?" > prompts.txt
+echo "What is the name of Hamlet's mother?" >> prompts.txt
+
+python generate.py --prompts-file prompts.txt --stop-sequence "SCENE" --output-file results.jsonl
+
+python generate.py --prompt "To be, or not to be, that is the question:" --temperature 0.9 --top-p 0.95 --rep-penalty 1.2 --seed 42

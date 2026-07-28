@@ -1,13 +1,20 @@
 """
-train.py - T4-optimized training with:
+train.py - Production-Grade T4-optimized training
+Features:
   - float16 mixed precision (T4-native)
   - Gradient accumulation (effective batch = 64)
-  - WandB logging
+  - WandB logging with resume capability
   - Cosine LR with warmup
+  - Checkpoint resumption (crash recovery)
+  - Early stopping to prevent overfitting
+  - Graceful interruption handling (Ctrl+C saves checkpoint)
+  - Memory management (GPU cache clearing during eval)
 """
 import math
 import time
 import torch
+import signal
+import gc
 from torch.amp import autocast, GradScaler
 
 from config import (
@@ -19,6 +26,21 @@ from config import (
 )
 from model import ShakespeareGPT, ModelConfig, count_parameters
 from dataset import get_dataloader, split_data
+
+# Early stopping patience (in steps)
+EARLY_STOPPING_PATIENCE = 1000 
+
+# Global flag for graceful shutdown
+shutdown_requested = False
+
+def signal_handler(sig, frame):
+    global shutdown_requested
+    print("\n[!] Shutdown signal received. Saving final checkpoint and exiting gracefully...")
+    shutdown_requested = True
+
+# Register signal handlers for Ctrl+C (SIGINT) and termination (SIGTERM)
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
 
 
 def get_lr(step: int) -> float:
@@ -39,20 +61,40 @@ def evaluate(model: ShakespeareGPT, device: torch.device, dtype: torch.dtype) ->
         dl = get_dataloader(split, batch_size=BATCH_SIZE, shuffle=False)
         losses = []
         for x, y in dl:
-            x, y = x.to(device), y.to(device)
+            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             with autocast(device_type=device.type, dtype=dtype):
                 _, loss, _ = model(x, y)
             losses.append(loss.item())
         mean_loss = sum(losses) / max(1, len(losses))
         out[f"{split}_loss"] = mean_loss
         out[f"{split}_perplexity"] = math.exp(min(mean_loss, 20))  # cap for safety
+    
+    # Prevent memory leaks during long training runs
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+        gc.collect()
+        
     model.train()
     return out
 
 
+def save_checkpoint(model, optimizer, step, val_loss, cfg, filename="last.pt"):
+    """Centralized checkpoint saving to ensure consistency."""
+    ckpt_path = CHECKPOINT_DIR / filename
+    torch.save({
+        "step": step,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "val_loss": val_loss,
+        "config": cfg,
+    }, ckpt_path)
+    return ckpt_path
+
+
 def train():
+    global shutdown_requested
     print("=" * 60)
-    print("[PHASE 5] Pre-Training (T4-optimized)")
+    print("[PHASE 5] Pre-Training (Production-Grade)")
     print("=" * 60)
 
     # Initialize WandB
@@ -63,6 +105,7 @@ def train():
             wandb_run = wandb.init(
                 project=WANDB_PROJECT,
                 entity=WANDB_ENTITY,
+                resume="allow",  # Allow resuming the wandb run if it crashed
                 config={k: v for k, v in locals().items() if isinstance(v, (int, float, str, bool))},
             )
         except Exception as e:
@@ -94,18 +137,33 @@ def train():
 
     scaler = GradScaler(enabled=(dtype == torch.float16))
 
+    # --- RESUME LOGIC ---
+    start_step = 0
+    best_val_loss = float("inf")
+    steps_without_improvement = 0
+    resume_path = CHECKPOINT_DIR / "last.pt"
+    
+    if resume_path.exists():
+        print(f"[*] Found existing checkpoint at {resume_path}. Resuming training...")
+        checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        start_step = checkpoint["step"]
+        best_val_loss = checkpoint.get("val_loss", float("inf"))
+        print(f"[+] Resumed from step {start_step} with best_val_loss: {best_val_loss:.4f}")
+    else:
+        print("[*] No previous checkpoint found. Starting fresh training.")
+
     train_loader = get_dataloader("train", batch_size=BATCH_SIZE, shuffle=True)
     data_iter = iter(train_loader)
 
     model.train()
-    step = 0
-    micro_step = 0
+    step = start_step
     t0 = time.time()
-    best_val_loss = float("inf")
     accumulated_loss = 0.0
 
-    while step < MAX_STEPS:
-        # Update LR per optimizer step (not micro-step)
+    while step < MAX_STEPS and not shutdown_requested:
+        # Update LR per optimizer step
         lr = get_lr(step)
         for pg in optimizer.param_groups:
             pg["lr"] = lr
@@ -119,8 +177,6 @@ def train():
                 x, y = next(data_iter)
 
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-
-            # Scale loss by accumulation steps
             is_last_accum = (accum_step == GRAD_ACCUM_STEPS - 1)
 
             with autocast(device_type=device.type, dtype=dtype):
@@ -144,6 +200,11 @@ def train():
             avg_loss = accumulated_loss / GRAD_ACCUM_STEPS
             accumulated_loss = 0.0
             mem_gb = torch.cuda.max_memory_allocated() / 1e9 if device.type == "cuda" else 0
+            
+            # Reset max memory tracking for accurate per-interval measurement
+            if device.type == "cuda":
+                torch.cuda.reset_max_memory_allocated()
+
             log_data = {
                 "step": step,
                 "loss": avg_loss,
@@ -170,23 +231,29 @@ def train():
             if wandb_run:
                 wandb_run.log({f"eval/{k}": v for k, v in metrics.items()}, step=step)
 
+            # Early Stopping & Best Model Check
             if metrics["val_loss"] < best_val_loss:
                 best_val_loss = metrics["val_loss"]
-                ckpt_path = CHECKPOINT_DIR / "best.pt"
-                torch.save({
-                    "step": step,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "val_loss": best_val_loss,
-                    "config": cfg,
-                }, ckpt_path)
+                steps_without_improvement = 0
+                ckpt_path = save_checkpoint(model, optimizer, step, best_val_loss, cfg, "best.pt")
                 print(f"[+] New best model saved: {ckpt_path}")
+            else:
+                steps_without_improvement += EVAL_INTERVAL
+                if steps_without_improvement >= EARLY_STOPPING_PATIENCE:
+                    print(f"[!] Early stopping triggered. No improvement in {EARLY_STOPPING_PATIENCE} steps.")
+                    shutdown_requested = True
 
+        # Periodic Checkpoint (acts as the resume point)
         if step > 0 and step % SAVE_INTERVAL == 0:
-            ckpt_path = CHECKPOINT_DIR / f"step_{step}.pt"
-            torch.save({"step": step, "model_state_dict": model.state_dict(), "config": cfg}, ckpt_path)
+            ckpt_path = save_checkpoint(model, optimizer, step, best_val_loss, cfg, "last.pt")
+            print(f"[*] Checkpoint saved: {ckpt_path}")
 
         step += 1
+
+    # Final save on exit (normal completion or interrupted)
+    if step > start_step:
+        final_ckpt = save_checkpoint(model, optimizer, step, best_val_loss, cfg, "last.pt")
+        print(f"[*] Final checkpoint saved: {final_ckpt}")
 
     if wandb_run:
         wandb_run.finish()

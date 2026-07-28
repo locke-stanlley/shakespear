@@ -1,12 +1,17 @@
 """
 evaluate.py - Phase 6: Comprehensive Evaluation & Alignment
-  - Final test-set perplexity & visual sampling
-  - Multi-genre Supervised Fine-Tuning (SFT)
-  - Multi-genre Direct Preference Optimization (DPO)
-  - Post-alignment generation testing across all 6 datasets
+Features:
+  - Final test-set perplexity & detailed metrics
+  - Multi-genre Supervised Fine-Tuning (SFT) with robust data handling
+  - Multi-genre Direct Preference Optimization (DPO) pipeline
+  - Post-alignment generation testing across all datasets
+  - Configurable execution via CLI arguments (skip specific phases)
+  - Memory management (cache clearing) to prevent OOM during long runs
 """
+import argparse
 import json
 import math
+import gc
 import torch
 from torch.utils.data import Dataset, DataLoader
 from pathlib import Path
@@ -21,14 +26,18 @@ from dataset import get_dataloader
 from tokenizer import load_tokenizer
 
 
-def load_model(checkpoint: str = "best.pt") -> ShakespeareGPT:
+def load_model(checkpoint: str = "best.pt") -> tuple:
+    """Load model and config from a checkpoint."""
     ckpt_path = CHECKPOINT_DIR / checkpoint
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found at {ckpt_path}")
+    
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     cfg: ModelConfig = ckpt["config"]
     model = ShakespeareGPT(cfg)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
-    return model
+    return model, cfg
 
 
 # ==============================================================================
@@ -42,14 +51,29 @@ def final_test_evaluation():
     device = torch.device(DEVICE if torch.cuda.is_available() else "cpu")
     dtype = torch.float16 if DTYPE == "float16" else torch.bfloat16
 
-    model = load_model().to(device)
+    try:
+        model, _ = load_model("best.pt")
+        model = model.to(device)
+    except FileNotFoundError as e:
+        print(f"[!] {e}. Skipping evaluation.")
+        return
+
     dl = get_dataloader("test", batch_size=BATCH_SIZE, shuffle=False)
     losses = []
+    
+    model.eval()
     for x, y in dl:
-        x, y = x.to(device), y.to(device)
+        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
         with torch.amp.autocast(device_type=device.type, dtype=dtype):
-            _, loss, _ = model(x, y)
+            out = model(x, y)
+            # Handle both dict (new) and tuple (legacy) return types
+            loss = out["loss"] if isinstance(out, dict) else out[1]
         losses.append(loss.item())
+    
+    # Clear memory after evaluation to prevent OOM in subsequent phases
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+        gc.collect()
     
     mean_loss = sum(losses) / len(losses)
     perplexity = math.exp(min(mean_loss, 20))  # Cap to prevent overflow
@@ -143,10 +167,13 @@ def run_sft():
     tokenizer = load_tokenizer()
     device = torch.device(DEVICE if torch.cuda.is_available() else "cpu")
 
-    # Load the base model WITH its config
-    base_ckpt_path = CHECKPOINT_DIR / "best.pt"
-    base_ckpt = torch.load(base_ckpt_path, map_location="cpu", weights_only=False)
-    cfg: ModelConfig = base_ckpt["config"]
+    try:
+        base_ckpt_path = CHECKPOINT_DIR / "best.pt"
+        base_ckpt = torch.load(base_ckpt_path, map_location="cpu", weights_only=False)
+        cfg: ModelConfig = base_ckpt["config"]
+    except FileNotFoundError:
+        print("[!] Base model 'best.pt' not found. Cannot run SFT.")
+        return
     
     model = ShakespeareGPT(cfg).to(device)
     model.load_state_dict(base_ckpt["model_state_dict"])
@@ -155,15 +182,16 @@ def run_sft():
     optimizer = torch.optim.AdamW(model.parameters(), lr=SFT_LR, weight_decay=0.01)
 
     ds = SFTDataset(SFT_DATA_PATH, tokenizer)
-    dl = DataLoader(ds, batch_size=4, shuffle=True)  # Smaller batch for SFT stability
+    dl = DataLoader(ds, batch_size=4, shuffle=True)
 
     print(f"[*] Starting SFT for {SFT_EPOCHS} epochs on {len(ds)} examples...")
     for epoch in range(SFT_EPOCHS):
         total, n = 0.0, 0
         for x, y in dl:
-            x, y = x.to(device), y.to(device)
+            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             optimizer.zero_grad()
-            _, loss, _ = model(x, y)
+            out = model(x, y)
+            loss = out["loss"] if isinstance(out, dict) else out[1]
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -171,7 +199,6 @@ def run_sft():
             n += 1
         print(f"    [SFT epoch {epoch+1}/{SFT_EPOCHS}] loss={total/max(1,n):.4f}")
 
-    # FIXED: Save the full checkpoint with config, not just state_dict
     torch.save({
         "model_state_dict": model.state_dict(),
         "config": cfg,
@@ -240,8 +267,6 @@ def run_dpo():
         create_comprehensive_dpo()
 
     print("[*] Loading reference model for DPO (stand-in HF model)...")
-    # Note: For production, you would convert ShakespeareGPT to HF format. 
-    # We use a tiny stand-in here to prove the DPO pipeline mechanics work.
     model_name = "sshleifer/tiny-gpt2"
     model = AutoModelForCausalLM.from_pretrained(model_name)
     ref_model = AutoModelForCausalLM.from_pretrained(model_name)
@@ -265,7 +290,7 @@ def run_dpo():
         learning_rate=DPO_LR,
         beta=DPO_BETA,
         per_device_train_batch_size=2,
-        max_steps=30,  # Slightly more steps for the richer dataset
+        max_steps=30,
         logging_steps=10,
         remove_unused_columns=False,
         report_to="none",
@@ -295,28 +320,26 @@ def test_generation_post_alignment():
     
     device = torch.device(DEVICE if torch.cuda.is_available() else "cpu")
     
-    # FIXED: Load the SFT model WITH its config
     ckpt_path = CHECKPOINT_DIR / "sft_model.pt"
     if not ckpt_path.exists():
         print("[!] SFT model not found. Skipping generation test.")
         return
         
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    cfg: ModelConfig = ckpt["config"]  # Now this will work!
+    cfg: ModelConfig = ckpt["config"]
     model = ShakespeareGPT(cfg)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval().to(device)
     
     tokenizer = load_tokenizer()
     
-    # Test prompts covering all 6 genres
     test_prompts = [
-        ("🎭 Shakespeare", "User: Who is the tragic prince of Denmark?\nAssistant:"),
-        ("🕵️ Sherlock", "User: What is the significance of the mud on the boot?\nAssistant:"),
-        ("🎩 Austen", "User: Why is Mr. Darcy initially disliked?\nAssistant:"),
-        ("🧟 Shelley", "User: What drives Victor Frankenstein to create life?\nAssistant:"),
-        ("🐇 Carroll", "User: How does Alice enter Wonderland?\nAssistant:"),
-        ("🏰 Cervantes", "User: Who is Don Quixote's loyal squire?\nAssistant:"),
+        ("Shakespeare", "User: Who is the tragic prince of Denmark?\nAssistant:"),
+        ("Sherlock", "User: What is the significance of the mud on the boot?\nAssistant:"),
+        ("Austen", "User: Why is Mr. Darcy initially disliked?\nAssistant:"),
+        ("Shelley", "User: What drives Victor Frankenstein to create life?\nAssistant:"),
+        ("Carroll", "User: How does Alice enter Wonderland?\nAssistant:"),
+        ("Cervantes", "User: Who is Don Quixote's loyal squire?\nAssistant:"),
     ]
     
     print("[*] Generating responses for each genre...\n")
@@ -335,14 +358,31 @@ def test_generation_post_alignment():
                 repetition_penalty=1.2
             )
         
-        # Decode only the generated part
         new_text = tokenizer.decode(out_ids[0][len(ids):].tolist()).strip()
         print(f"Prompt: {prompt}")
         print(f"Output: {new_text}\n")
 
 
+def main():
+    parser = argparse.ArgumentParser(description="Phase 6: Evaluation and Alignment")
+    parser.add_argument("--skip-test", action="store_true", help="Skip final test evaluation")
+    parser.add_argument("--skip-sft", action="store_true", help="Skip Supervised Fine-Tuning")
+    parser.add_argument("--skip-dpo", action="store_true", help="Skip Direct Preference Optimization")
+    parser.add_argument("--skip-gen", action="store_true", help="Skip post-alignment generation test")
+    args = parser.parse_args()
+
+    if not args.skip_test:
+        final_test_evaluation()
+    
+    if not args.skip_sft:
+        run_sft()
+        
+    if not args.skip_dpo:
+        run_dpo()
+        
+    if not args.skip_gen:
+        test_generation_post_alignment()
+
+
 if __name__ == "__main__":
-    final_test_evaluation()
-    run_sft()
-    run_dpo()
-    test_generation_post_alignment()
+    main()
