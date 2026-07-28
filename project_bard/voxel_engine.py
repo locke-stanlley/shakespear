@@ -260,14 +260,20 @@ class VoxelEngine:
         # Save voxel grid
         np.save(path.with_suffix('.grid.npy'), self.voxel_grid)
         
+        # Convert token_coords to JSON-serializable format
+        token_coords_serializable = {}
+        for token_id, coords in self.token_coords.items():
+            # Convert numpy int64 to Python int
+            token_coords_serializable[str(int(token_id))] = [int(c) for c in coords]
+        
         # Save metadata and mappings
         metadata = {
-            'grid_size': self.grid_size,
-            'pca_components': self.pca_components,
-            'total_tokens': self.total_tokens,
-            'vocab_size': self.vocab_size,
-            'is_trained': self.is_trained,
-            'token_coords': {str(k): v for k, v in self.token_coords.items()},
+            'grid_size': int(self.grid_size),
+            'pca_components': int(self.pca_components),
+            'total_tokens': int(self.total_tokens),
+            'vocab_size': int(self.vocab_size),
+            'is_trained': bool(self.is_trained),
+            'token_coords': token_coords_serializable,
             'tunnels': self.tunnels
         }
         
